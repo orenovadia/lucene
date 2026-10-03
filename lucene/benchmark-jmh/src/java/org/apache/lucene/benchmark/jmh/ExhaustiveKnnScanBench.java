@@ -19,6 +19,8 @@ package org.apache.lucene.benchmark.jmh;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader;
@@ -76,6 +78,7 @@ public class ExhaustiveKnnScanBench {
 
   IndexReader reader;
   org.apache.lucene.codecs.KnnVectorsReader knnReader;
+  org.apache.lucene.index.FloatVectorValues vectorValues;
   AcceptDocs acceptDocs;
   float[] target;
   int k;
@@ -131,6 +134,7 @@ public class ExhaustiveKnnScanBench {
       throw new IllegalStateException("expected single segment");
     }
     knnReader = ((CodecReader) segReader).getVectorReader();
+    vectorValues = segReader.getFloatVectorValues(FIELD);
 
     // Filter bits at the requested selectivity over maxDoc.
     int maxDoc = segReader.maxDoc();
@@ -215,5 +219,46 @@ public class ExhaustiveKnnScanBench {
       sb.append(' ').append(sd.doc).append(':').append(sd.score);
     }
     System.out.println(sb);
+
+    // Ground truth: brute-force scan of every *accepted* vector, top-k by cosine.
+    record DS(int doc, float score) {}
+    List<DS> all = new ArrayList<>();
+    org.apache.lucene.util.Bits acceptedBits = bench.acceptDocs.bits();
+    for (int ord = 0; ord < bench.vectorValues.size(); ord++) {
+      int doc = bench.vectorValues.ordToDoc(ord);
+      if (acceptedBits.get(doc) == false) {
+        continue;
+      }
+      all.add(
+          new DS(
+              doc,
+              org.apache.lucene.index.VectorSimilarityFunction.COSINE.compare(
+                  bench.vectorValues.vectorValue(ord), bench.target)));
+    }
+    all.sort((a, b) -> Float.compare(b.score, a.score));
+    int n = Math.min(bench.k, all.size());
+    int docMismatches = 0;
+    float maxScoreDelta = 0;
+    for (int i = 0; i < n; i++) {
+      DS gt = all.get(i);
+      var sd = td.scoreDocs[i];
+      if (gt.doc() != sd.doc) {
+        docMismatches++;
+        System.out.println("pos " + i + " doc mismatch: search=" + sd.doc + " brute=" + gt.doc()
+            + " scores " + sd.score + " vs " + gt.score());
+      }
+      maxScoreDelta = Math.max(maxScoreDelta, Math.abs(gt.score() - sd.score));
+    }
+    System.out.println(
+        "RESULT "
+            + bench.density
+            + '/'
+            + bench.filter
+            + " n="
+            + n
+            + " docMismatches="
+            + docMismatches
+            + " maxScoreDelta="
+            + maxScoreDelta);
   }
 }
