@@ -42,7 +42,9 @@ import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.internal.hppc.IntObjectHashMap;
 import org.apache.lucene.search.AcceptDocs;
+import org.apache.lucene.search.DocAndFloatFeatureBuffer;
 import org.apache.lucene.search.KnnCollector;
+import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.DataAccessHint;
 import org.apache.lucene.store.DataInput;
@@ -52,12 +54,14 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.PreloadHint;
 import org.apache.lucene.store.RandomAccessInput;
+import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.GroupVIntUtil;
 import org.apache.lucene.util.IOSupplier;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.RamUsageEstimator;
 import org.apache.lucene.util.hnsw.CloseableRandomVectorScorerSupplier;
+import org.apache.lucene.util.hnsw.HasKnnVectorValues;
 import org.apache.lucene.util.hnsw.HnswGraph;
 import org.apache.lucene.util.hnsw.HnswGraphSearcher;
 import org.apache.lucene.util.hnsw.OrdinalTranslatedKnnCollector;
@@ -374,35 +378,74 @@ public final class Lucene99HnswVectorsReader extends KnnVectorsReader
       HnswGraphSearcher.search(
           scorer, collector, getGraph(fieldEntry), acceptedOrds, filteredDocCount);
     } else {
-      // if k is larger than the number of vectors we expect to visit in an HNSW search,
-      // we can just iterate over all vectors and collect them.
-      int[] ords = new int[EXHAUSTIVE_BULK_SCORE_ORDS];
-      float[] scores = new float[EXHAUSTIVE_BULK_SCORE_ORDS];
-      int numOrds = 0;
-      for (int i = 0; i < numVectors; i++) {
-        if (acceptedOrds == null || acceptedOrds.get(i)) {
-          if (knnCollector.earlyTerminated()) {
-            break;
-          }
-          ords[numOrds++] = i;
-          if (numOrds == ords.length) {
-            knnCollector.incVisitedCount(numOrds);
-            if (scorer.bulkScore(ords, scores, numOrds) > knnCollector.minCompetitiveSimilarity()) {
-              for (int j = 0; j < numOrds; j++) {
-                knnCollector.collect(scorer.ordToDoc(ords[j]), scores[j]);
-              }
+      exhaustiveScan(scorer, knnCollector, acceptDocs);
+    }
+  }
+
+  private static void exhaustiveGeneric(
+      RandomVectorScorer scorer, KnnCollector knnCollector, Bits acceptedOrds, int numVectors)
+      throws IOException {
+    int[] ords = new int[EXHAUSTIVE_BULK_SCORE_ORDS];
+    float[] scores = new float[EXHAUSTIVE_BULK_SCORE_ORDS];
+    int numOrds = 0;
+    for (int i = 0; i < numVectors; i++) {
+      if (acceptedOrds == null || acceptedOrds.get(i)) {
+        if (knnCollector.earlyTerminated()) {
+          break;
+        }
+        ords[numOrds++] = i;
+        if (numOrds == ords.length) {
+          knnCollector.incVisitedCount(numOrds);
+          if (scorer.bulkScore(ords, scores, numOrds) > knnCollector.minCompetitiveSimilarity()) {
+            for (int j = 0; j < numOrds; j++) {
+              knnCollector.collect(scorer.ordToDoc(ords[j]), scores[j]);
             }
-            numOrds = 0;
           }
+          numOrds = 0;
         }
       }
+    }
 
-      if (numOrds > 0) {
-        knnCollector.incVisitedCount(numOrds);
-        if (scorer.bulkScore(ords, scores, numOrds) > knnCollector.minCompetitiveSimilarity()) {
-          for (int j = 0; j < numOrds; j++) {
-            knnCollector.collect(scorer.ordToDoc(ords[j]), scores[j]);
-          }
+    if (numOrds > 0) {
+      knnCollector.incVisitedCount(numOrds);
+      if (scorer.bulkScore(ords, scores, numOrds) > knnCollector.minCompetitiveSimilarity()) {
+        for (int j = 0; j < numOrds; j++) {
+          knnCollector.collect(scorer.ordToDoc(ords[j]), scores[j]);
+        }
+      }
+    }
+  }
+
+  /**
+   * Exhaustive scan for the case where HNSW traversal is not worthwhile (e.g. the filter is
+   * selective enough that we expect to visit most accepted vectors anyway). Score in bulk via
+   * {@link VectorScorer.Bulk}, which iterates the values' docs-with-field iterator directly and
+   * scores in ord space, avoiding both the per-ordinal accept test on the (possibly
+   * ord-translating) accepted Bits and the per-ordinal ord-to-doc translation. Falls back to the
+   * generic ordinal sweep if the scorer does not expose its vector values.
+   */
+  private static void exhaustiveScan(
+      RandomVectorScorer scorer, KnnCollector knnCollector, AcceptDocs acceptDocs)
+      throws IOException {
+    HasKnnVectorValues hasValues = scorer instanceof HasKnnVectorValues h ? h : null;
+    if (hasValues == null || hasValues.values() == null) {
+      exhaustiveGeneric(scorer, knnCollector, acceptDocs.bits(), scorer.maxOrd());
+      return;
+    }
+    KnnVectorValues.DocIndexIterator docsWithField = hasValues.values().iterator();
+    VectorScorer.Bulk bulk =
+        VectorScorer.Bulk.fromRandomScorerSparse(scorer, docsWithField, acceptDocs.iterator());
+    DocAndFloatFeatureBuffer buffer = new DocAndFloatFeatureBuffer();
+    for (float maxScore = bulk.nextDocsAndScores(NO_MORE_DOCS, null, buffer);
+        buffer.size > 0;
+        maxScore = bulk.nextDocsAndScores(NO_MORE_DOCS, null, buffer)) {
+      if (knnCollector.earlyTerminated()) {
+        break;
+      }
+      knnCollector.incVisitedCount(buffer.size);
+      if (maxScore > knnCollector.minCompetitiveSimilarity()) {
+        for (int j = 0; j < buffer.size; j++) {
+          knnCollector.collect(buffer.docs[j], buffer.features[j]);
         }
       }
     }
